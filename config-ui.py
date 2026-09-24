@@ -72,23 +72,42 @@ def normalize_providers(raw: list, existing: list | None = None) -> tuple[list, 
 
     warnings: list = []
     merged: dict = {}
+    meta: dict = {}   # 渠道名 -> {daily_quota, costs}（跨同名卡片合并）
     order: list = []
 
-    def parse_models(item) -> list:
+    def parse_models(item) -> tuple[list, dict]:
+        """解析模型映射输入行，返回 (mapping, costs)。
+
+        每行支持三种写法：
+        - `对外名`（同名直通）
+        - `对外名: 上游名`（重命名）
+        - `对外名: 上游名: 单次消耗`（第 3 段为该模型每次调用消耗的额度，
+          如魔搭魔粒；对外名作键写入 preferences.MODEL_COST）
+        """
         mapping = []
+        costs: dict = {}
         for line in item.get("models") or []:
             text = str(line).strip()
             if not text:
                 continue
-            external, separator, upstream = text.partition(":")
-            external, upstream = external.strip(), upstream.strip()
+            parts = [seg.strip() for seg in text.split(":")]
+            if len(parts) == 1:
+                if parts[0]:
+                    mapping.append(parts[0])      # 同名: 纯字符串
+                continue
+            external, upstream = parts[0], parts[1]
             if not external:
                 continue
-            if not separator or not upstream or upstream == external:
+            if not upstream or upstream == external:
                 mapping.append(external)          # 同名: 纯字符串
             else:
                 mapping.append({upstream: external})  # 官方语义 {上游名: 对外名}
-        return mapping
+            if len(parts) >= 3 and parts[2]:
+                try:
+                    costs[external] = float(parts[2])
+                except ValueError:
+                    pass
+        return mapping, costs
 
     for item in raw or []:
         name = str(item.get("provider") or "").strip()
@@ -106,7 +125,7 @@ def normalize_providers(raw: list, existing: list | None = None) -> tuple[list, 
         if not keys:
             warnings.append(f"渠道「{name}」没填任何 API Key，未保存")
             continue
-        mapping = parse_models(item)
+        mapping, costs = parse_models(item)
         if name in merged:
             # 同名合并：Key 与模型映射取并集，顺序保持先出现者优先
             base = merged[name]
@@ -116,6 +135,11 @@ def normalize_providers(raw: list, existing: list | None = None) -> tuple[list, 
             for m in mapping:
                 if m not in base_models:
                     base_models.append(m)
+            base_meta = meta[name]
+            if base_meta.get("daily_quota") in (None, ""):
+                base_meta["daily_quota"] = item.get("daily_quota")
+            for cost_name, cost_value in costs.items():
+                base_meta["costs"].setdefault(cost_name, cost_value)
             continue
         old = old_by_name.get(name, {})
         provider = {
@@ -132,11 +156,22 @@ def normalize_providers(raw: list, existing: list | None = None) -> tuple[list, 
                 "model": mapping or ["gpt-4o-mini"],
             }
         )
-        # 保留手工配置的 preferences（DAILY_QUOTA、TOKEN_RATE_LIMIT 等），
-        # 只维护 AUTO_RETRY 这一项（显式写入 true/false，勾选状态不回弹）。
+        # 保留手工配置的 preferences（TOKEN_RATE_LIMIT 等），AUTO_RETRY 显式写入；
+        # 表单里的每日额度/单次消耗写入 DAILY_QUOTA / MODEL_COST（留空则移除）。
         preferences = dict(old.get("preferences") or {})
         preferences["AUTO_RETRY"] = bool(item.get("auto_retry", True))
+        daily_raw = item.get("daily_quota")
+        if daily_raw in (None, ""):
+            preferences.pop("DAILY_QUOTA", None)
+        else:
+            try:
+                preferences["DAILY_QUOTA"] = float(daily_raw)
+            except (TypeError, ValueError):
+                warnings.append(f"渠道「{name}」的每日额度 {daily_raw!r} 不是数字，已忽略")
+        if costs:
+            preferences["MODEL_COST"] = dict(costs)
         provider["preferences"] = preferences
+        meta[name] = {"daily_quota": item.get("daily_quota"), "costs": dict(costs)}
         merged[name] = provider
         order.append(name)
 
@@ -244,6 +279,21 @@ def status():
     }
 
 
+@app.get("/api/quota")
+def quota_proxy():
+    """实时额度：代理主服务的 /v1/quota-status（token 窗口只在主服务内存里）。"""
+    import json as _json
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{MAIN_PORT}/v1/quota-status", timeout=5
+        ) as resp:
+            return _json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        return {"error": str(exc), "providers": []}
+
+
 @app.get("/api/config")
 def get_config():
     data = load_config()
@@ -272,17 +322,25 @@ def get_config():
     for p in data.get("providers") or []:
         api = p.get("api")
         keys = api if isinstance(api, list) else [api]
-        models = [
-            f"{ext}: {up}" if up != ext else ext
-            for ext, up in model_pairs(p.get("model"))
-        ]
+        prefs = p.get("preferences") or {}
+        cost_raw = prefs.get("MODEL_COST") or {}
+        models = []
+        for ext, up in model_pairs(p.get("model")):
+            cost = cost_raw.get(ext, cost_raw.get(up))
+            if cost is not None:
+                models.append(f"{ext}: {up}: {cost}")
+            elif up != ext:
+                models.append(f"{ext}: {up}")
+            else:
+                models.append(ext)
         providers.append(
             {
                 "provider": p.get("provider"),
                 "base_url": p.get("base_url"),
                 "keys": keys,
                 "models": models,
-                "auto_retry": bool((p.get("preferences") or {}).get("AUTO_RETRY", True)),
+                "auto_retry": bool(prefs.get("AUTO_RETRY", True)),
+                "daily_quota": prefs.get("DAILY_QUOTA"),
             }
         )
     api_keys = [
@@ -423,6 +481,14 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
 
   <div class="card">
+    <div class="prov-head">
+      <span class="prov-title">额度状态（每 5 秒自动刷新）</span>
+      <button class="ghost mini" onclick="loadQuota()">刷新</button>
+    </div>
+    <div id="quotaBody" class="hint" style="margin:0">加载中…</div>
+  </div>
+
+  <div class="card">
     <div class="prov-head"><span class="prov-title">对外 Key（填到客户端里的那个）</span></div>
     <div id="apikeyArea"></div>
     <div class="hint">这是你自己的统一入口 Key；真正的额度限制在各上游渠道。</div>
@@ -489,10 +555,12 @@ function render(st) {
       <div class="row" style="margin-top:8px">
         <div class="field"><label>API Key（每行一个，多个自动轮询）</label>
           <textarea rows="3" oninput="CFG.providers[${i}].keys=this.value.split('\\n')">${esc((p.keys||[]).join('\\n'))}</textarea></div>
-        <div class="field"><label>模型映射（每行: 对外名字: 上游真实名）</label>
+        <div class="field"><label>模型映射（每行: 对外名: 上游名[: 单次消耗]）</label>
           <textarea rows="3" oninput="CFG.providers[${i}].models=this.value.split('\\n')">${esc((p.models||[]).join('\\n'))}</textarea></div>
       </div>
       <div class="row" style="margin-top:8px">
+        <div class="field"><label>每日额度（如魔搭 250 魔粒/天，留空不启用）</label>
+          <input value="${esc(p.daily_quota ?? '')}" oninput="CFG.providers[${i}].daily_quota=this.value"></div>
         <label style="display:flex;align-items:center;gap:6px;margin:0">
           <input type="checkbox" style="width:auto" ${p.auto_retry !== false ? 'checked' : ''}
             onchange="CFG.providers[${i}].auto_retry=this.checked">
@@ -567,6 +635,37 @@ setInterval(() => fetch('/api/status').then(r => r.json()).then(st => {
   } else { dot.className = 'dot bad'; stat.textContent = '未运行';
     document.getElementById('mem').textContent = ''; }
 }), 5000);
+
+async function loadQuota() {
+  const body = document.getElementById('quotaBody');
+  try {
+    const j = await fetch('/api/quota').then(r => r.json());
+    if (j.error) { body.textContent = '读取失败: ' + j.error; return; }
+    if (!j.providers || !j.providers.length) {
+      body.textContent = '暂无额度数据（需要在渠道里配置每日额度或 token 限流）'; return;
+    }
+    let html = '';
+    j.providers.forEach(pr => {
+      html += '<div style="margin:6px 0 2px;font-weight:600">' + esc(pr.provider) + '</div>';
+      (pr.keys || []).forEach(k => {
+        const bits = [];
+        if (k.daily_spent !== null && k.daily_spent !== undefined)
+          bits.push('今日已用 ' + k.daily_spent + ' / ' + (pr.daily_quota ?? '—') +
+            ' 魔粒，剩 ' + k.daily_remaining);
+        (k.token_windows || []).forEach(w =>
+          bits.push('本' + w.period + '秒窗口已用 ' + Math.round(w.used) + ' / ' + w.limit + ' tokens'));
+        html += '<div style="margin-left:14px">' + esc(k.key) + '：' +
+          esc(bits.join('；') || '无额度配置') + '</div>';
+      });
+      const mc = Object.entries(pr.model_cost || {}).map(([m, c]) => m + '=' + c).join(', ');
+      html += '<div style="margin-left:14px;color:#777">单次消耗: ' +
+        esc(mc || ('默认 ' + pr.default_cost)) + '</div>';
+    });
+    body.innerHTML = html;
+  } catch (e) { body.textContent = '读取失败: ' + e; }
+}
+loadQuota();
+setInterval(loadQuota, 5000);
 </script>
 </body>
 </html>"""

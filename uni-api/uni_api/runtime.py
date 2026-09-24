@@ -2173,7 +2173,7 @@ except Exception:
     VERSION = 'unknown'
 logger.info("VERSION: %s", VERSION)
 
-PUBLIC_HEALTH_PATHS = {"/healthz"}
+PUBLIC_HEALTH_PATHS = {"/healthz", "/v1/quota-status"}
 rust_responses_control_plane = RustResponsesControlPlane()
 
 
@@ -3522,6 +3522,70 @@ async def rust_responses_complete(
 @app.get("/healthz", include_in_schema=False)
 async def healthz():
     return await healthz_response(VERSION)
+
+
+@app.get("/v1/quota-status", include_in_schema=False)
+async def quota_status():
+    """配置页轮询：每个渠道每个 Key 的每日额度与 token 滑动窗口实时状态。
+
+    Key 一律脱敏输出（前5后4），不返回明文；数据来自额度注册表
+    （每日额度落盘在 data/quota_state.json，token 窗口只在内存）。
+    """
+    from datetime import date as _date
+
+    from uni_api.rate_limit.quota import _key_hash, _quota_registry
+
+    conf = getattr(app.state, "config", {}) or {}
+    providers_cfg: dict = {}
+    for p in conf.get("providers") or []:
+        name = str(p.get("provider") or "")
+        if name:
+            providers_cfg[name] = p
+
+    today = _date.today().isoformat()
+    result = []
+    for name, quota in list(_quota_registry.items()):
+        entry: dict = {
+            "provider": name,
+            "daily_quota": quota.daily_quota,
+            "model_cost": quota.model_cost,
+            "default_cost": quota.default_cost,
+            "keys": [],
+        }
+        keys: list = []
+        provider_cfg = providers_cfg.get(name)
+        if provider_cfg is not None:
+            api_field = provider_cfg.get("api")
+            keys = [str(k) for k in api_field] if isinstance(api_field, list) else [str(api_field)]
+        seen_hashes: set = set()
+        for key in [k for k in keys if k and k != "None"]:
+            key_hash = _key_hash(key)
+            if key_hash in seen_hashes:
+                continue
+            seen_hashes.add(key_hash)
+            row: dict = {
+                "key": f"{key[:5]}****{key[-4:]}",
+                "daily_spent": None,
+                "daily_remaining": None,
+                "token_windows": None,
+            }
+            if quota.daily_quota is not None and quota.store is not None:
+                spent = quota.store.spent(name, today, key_hash)
+                row["daily_spent"] = spent
+                row["daily_remaining"] = max(0.0, round(quota.daily_quota - spent, 6))
+            if quota.token_rules:
+                now = quota._now()
+                row["token_windows"] = [
+                    {
+                        "limit": limit,
+                        "period": period,
+                        "used": quota._window_used(key_hash, period, now),
+                    }
+                    for limit, period in quota.token_rules
+                ]
+            entry["keys"].append(row)
+        result.append(entry)
+    return {"date": today, "providers": result}
 
 
 @app.get("/v1/observability/runtime", include_in_schema=False)
