@@ -367,6 +367,21 @@ def _mask(key) -> str:
     return f"{key[:5]}****{key[-4:]}" if len(key) > 12 else ("(空)" if not key else key)
 
 
+@app.post("/api/frontend-log")
+def frontend_log(payload: dict):
+    """接收前端自检日志（页面内存中的 Key 状态、JS 报错），写同一个日志文件。"""
+    try:
+        for card in payload.get("cards", []):
+            _save_log(
+                f"  [前端内存] 卡片 {card.get('name')!r}: keys={card.get('keys')}"
+            )
+        if payload.get("js_error"):
+            _save_log(f"  [JS报错] {payload['js_error']}")
+    except Exception as exc:
+        _save_log(f"[前端日志解析失败] {exc}")
+    return {"ok": True}
+
+
 @app.post("/api/config")
 def post_config(payload: dict):
     _save_log("=" * 60)
@@ -591,7 +606,7 @@ function render(st) {
       </div>
       <div class="row" style="margin-top:8px">
         <div class="field"><label>API Key（每行一个，多个自动轮询）</label>
-          <textarea rows="3" oninput="CFG.providers[${i}].keys=this.value.split('\\n')">${esc((p.keys||[]).join('\\n'))}</textarea></div>
+          <textarea rows="3" oninput="setKeys(${i},this)">${esc((p.keys||[]).join('\\n'))}</textarea></div>
         <div class="field"><label>模型映射（每行: 对外名: 上游名[: 单次消耗]）</label>
           <textarea rows="3" oninput="CFG.providers[${i}].models=this.value.split('\\n')">${esc((p.models||[]).join('\\n'))}</textarea></div>
       </div>
@@ -608,6 +623,24 @@ function render(st) {
   });
 }
 
+window.onerror = function(msg, src, line, col) {
+  try { fetch('/api/frontend-log', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({js_error: msg + ' @' + (src || 'inline') + ':' + line + ':' + col})}); } catch (e) {}
+};
+
+var _lastKeyLog = 0;
+function setKeys(i, el) {
+  CFG.providers[i].keys = el.value.split('\\n');
+  var now = Date.now();
+  if (now - _lastKeyLog > 1500) { _lastKeyLog = now;
+    try { fetch('/api/frontend-log', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({cards: [{name: CFG.providers[i].provider,
+        keys: (CFG.providers[i].keys || []).map(function(k) {
+          return k && k.trim() ? (k.slice(0, 5) + '****' + k.slice(-4) + '(长度' + k.length + ')') : '(空行)';
+        })}]})}); } catch (e) {}
+  }
+}
+
 function collect() {
   return {
     providers: CFG.providers,
@@ -616,6 +649,12 @@ function collect() {
 }
 
 async function save() {
+  try { fetch('/api/frontend-log', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({cards: CFG.providers.map(function(p) {
+      return {name: p.provider, keys: (p.keys || []).map(function(k) {
+        return k && k.trim() ? (k.slice(0, 5) + '****' + k.slice(-4)) : '(空)';
+      })};
+    })})}); } catch (e) {}
   const r = await fetch('/api/config', {method: 'POST',
     headers: {'Content-Type': 'application/json'}, body: JSON.stringify(collect())});
   const j = await r.json();
