@@ -516,8 +516,8 @@ async function save() {
   const j = await r.json();
   document.getElementById('saveMsg').textContent = j.saved ? '已保存 ✓' : ('失败: ' + j.error);
   if (j.warnings && j.warnings.length)
-    alert('以下内容没有保存：\n' + j.warnings.join('\n') +
-      '\n\n（同名渠道的多张卡片会自动合并 Key；全空卡片直接忽略）');
+    alert('以下内容没有保存：\\n' + j.warnings.join('\\n') +
+      '\\n\\n（同名渠道的多张卡片会自动合并 Key；全空卡片直接忽略）');
   setTimeout(() => document.getElementById('saveMsg').textContent = '', 3000);
   return j.saved;
 }
