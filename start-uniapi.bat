@@ -1,12 +1,12 @@
 @echo off
-rem uni-api Windows 原生启动脚本（无需 Docker）
-rem 服务地址: http://localhost:9377/v1
+rem Start uni-api main service (console mode, port 9377)
 cd /d E:\MyAPI
-netstat -ano | findstr ":9377 .*LISTENING" >nul
+netstat -ano | findstr /C:":9377 " | findstr "LISTENING" >nul
 if not errorlevel 1 (
-    echo 主服务已在运行，无需重复启动。
-    echo 调用入口: http://localhost:9377/v1   配置页面: http://localhost:9378
-    echo 查看日志: type uni-api-run.log
+    echo Main service is ALREADY running.
+    echo API    : http://localhost:9377/v1
+    echo Config : http://localhost:9378
+    echo Log    : type uni-api-run.log
     pause
     exit /b 0
 )

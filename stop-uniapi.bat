@@ -1,5 +1,8 @@
 @echo off
-rem 停止 uni-api 主服务（端口 9377）
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":9377 .*LISTENING"') do taskkill /F /PID %%a 2>nul
-echo uni-api 已停止
+rem Stop uni-api main service (port 9377)
+set KILLED=0
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr /C:":9377 " ^| findstr "LISTENING"') do (
+    taskkill /F /PID %%a >nul 2>&1 && set KILLED=1
+)
+if "%KILLED%"=="1" (echo uni-api stopped.) else (echo uni-api was not running.)
 pause

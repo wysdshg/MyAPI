@@ -350,16 +350,53 @@ def get_config():
     return {"providers": providers, "api_keys": api_keys}
 
 
+def _save_log(msg: str) -> None:
+    """保存链路专用日志（定位"保存后 Key 消失"用），带时间戳追加写入。"""
+    from datetime import datetime
+
+    try:
+        line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+        with open("config-ui-save.log", "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _mask(key) -> str:
+    key = str(key or "")
+    return f"{key[:5]}****{key[-4:]}" if len(key) > 12 else ("(空)" if not key else key)
+
+
 @app.post("/api/config")
 def post_config(payload: dict):
+    _save_log("=" * 60)
+    _save_log(f"收到保存请求：{len(payload.get('providers') or [])} 张渠道卡片")
+    for idx, item in enumerate(payload.get("providers") or []):
+        keys = [k for k in (item.get("keys") or []) if str(k).strip()]
+        _save_log(
+            f"  卡片[{idx}] 渠道名={item.get('provider')!r} "
+            f"base_url={item.get('base_url')!r} keys={len(keys)}把{[_mask(k) for k in keys]} "
+            f"模型={len(item.get('models') or [])}行 每日额度={item.get('daily_quota')!r} "
+            f"auto_retry={item.get('auto_retry')!r}"
+        )
     data = load_config()
     data["providers"], warnings = normalize_providers(
         payload.get("providers"), data.get("providers")
     )
     data["api_keys"] = normalize_api_keys(payload.get("api_keys"), data.get("api_keys"))
+    if warnings:
+        _save_log(f"归一化警告：{warnings}")
+    else:
+        _save_log("归一化警告：无")
     if not data["providers"]:
+        _save_log("拒绝保存：没有任何可用渠道")
         return JSONResponse({"error": "至少需要一个渠道"}, status_code=400)
+    for p in data["providers"]:
+        api = p.get("api")
+        keys = api if isinstance(api, list) else [api]
+        _save_log(f"写入渠道 {p.get('provider')}: keys={[_mask(k) for k in keys if k]}")
     save_config(data)
+    _save_log("保存完成（已写 api.yaml）")
     return {"saved": True, "warnings": warnings}
 
 
