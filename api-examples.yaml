@@ -1,0 +1,74 @@
+# ============================================================
+# 渠道配置模板（参考用，本文件不会被程序改写）
+# 复制需要的块到 api.yaml，或直接用图形界面 http://localhost:9378 添加
+# 官方语义: model 里 "- 上游真实模型名: 对外名字"；同名直接写字符串
+# 调用入口: http://localhost:9377/v1
+# ============================================================
+
+# ---------- 模板 1: OpenAI 兼容中转站（大部分免费渠道都是这种） ----------
+# - provider: my-provider            # 渠道名，随便起，不能重复
+#   base_url: https://your-free-provider.com/v1
+#   api: sk-xxxxxxxxxxxxxxxx         # 单个 Key
+#   # 多个 Key 自动轮询负载均衡（额度用完自动切下一个）:
+#   # api:
+#   #   - sk-aaaaaaaaaaaaaaaa
+#   #   - sk-bbbbbbbbbbbbbbbb
+#   model:
+#     - gpt-4o-mini                  # 同名: 直接写
+#     - deepseek-ai/DeepSeek-V3: deepseek-v3   # 改名: 上游名: 对外名
+#   preferences:
+#     AUTO_RETRY: true               # 失败自动重试下一个渠道（建议开启）
+
+# ---------- 模板 2: 跨渠道容灾（同一模型挂多个渠道） ----------
+# 免费额度用完/限速/失效时自动切换:
+#   同渠道下一个 Key → 冷却该渠道 → 下一个渠道，调用方无感
+# - provider: backup-site
+#   base_url: https://another-free-site.com/v1
+#   api: sk-yyyyyyyyyyyyyyyy
+#   model:
+#     - gpt-4o-mini                  # 和渠道 1 相同的对外名，即自动互为备份
+#   preferences:
+#     AUTO_RETRY: true
+
+# ---------- 模板 3: DeepSeek 官方 ----------
+# - provider: deepseek
+#   base_url: https://api.deepseek.com
+#   api: sk-zzzzzzzzzzzzzzzz
+#   model:
+#     - deepseek-chat
+
+# ---------- 模板 4: 硅基流动 SiliconFlow（注册送额度，国内直连） ----------
+# - provider: siliconflow
+#   base_url: https://api.siliconflow.cn/v1
+#   api: sk-zzzzzzzzzzzzzzzz        # 多个账号就写成列表，自动轮询
+#   model:
+#     - Qwen/Qwen2.5-7B-Instruct: qwen2.5-7b
+#   preferences:
+#     AUTO_RETRY: true
+#     TOKEN_RATE_LIMIT: 50000/min   # 每个账号 50000 token/分钟滑动窗口
+#                                   # （提示词+回复按实际 usage 累计，只存内存）
+
+# ---------- 模板 5: 模型 ModelScope 魔搭（每日 250 魔粒按模型计费） ----------
+# - provider: modelscope
+#   base_url: https://api-inference.modelscope.cn/v1
+#   api:                           # 多个账号（多把魔搭 Key）写成列表
+#     - ms-aaaaaaaaaaaaaaaa
+#     - ms-bbbbbbbbbbbbbbbb
+#   model:
+#     - Qwen/Qwen2.5-7B-Instruct: qwen2.5-7b
+#   preferences:
+#     AUTO_RETRY: true
+#     DAILY_QUOTA: 250             # 每个账号每天 250 魔粒，0 点重置
+#     MODEL_COST:                  # 单次调用扣多少魔粒（没列的模型默认扣 1）
+#       Qwen/Qwen2.5-7B-Instruct: 0.5   # 外部名/上游真实名写法都认
+#       Qwen3-30B-A3B: 1
+#       default: 1
+#     # 全部账号当天用完 → 429 并自动切换到下一个渠道；状态存 data/quota_state.json
+
+# ---------- 对外 Key（填到客户端里的统一入口 Key） ----------
+# api_keys:
+#   - api: sk-myapi-xxxxxx
+#     model:                         # 权限白名单（真正额度限制在各上游）
+#       - gpt-4o-mini
+#       - deepseek-v3
+#       # - all                     # 放开全部模型

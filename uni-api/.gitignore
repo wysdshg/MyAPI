@@ -1,0 +1,27 @@
+api.json
+*.yaml
+.env
+__pycache__
+.vscode
+node_modules
+.wrangler
+.pytest_cache
+rust/**/target/
+uni_api/_uni_api_native*.so
+uni_api/_uni_api_native*.dylib
+*.jpg
+*.json
+!vercel.json
+!uni_api/api/codex_models_pro_0_144_0.json
+# *.png
+*.db
+.aider*
+.idea
+docker-compose-*.yml
+data/
+*.db-wal
+*.db-shm
+postgres_data/
+uniapi_db/
+alembic/
+alembic.ini

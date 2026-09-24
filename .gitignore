@@ -1,0 +1,32 @@
+# ============ 真实密钥与运行时数据，绝不入库 ============
+# 实时配置（含各渠道真实 API Key），模板见 api-examples.yaml
+/api.yaml
+# 内部交接文档（含本机密钥与运维细节）
+/HANDOVER.md
+# 运行时数据（用量统计库、额度账本）
+/data/
+/uniapi_db/
+# 日志
+*.log
+*.log.*
+
+# ============ Python 产物 ============
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# ============ 环境变量 ============
+.env
+.env.*
+
+# ============ Rust 构建产物 ============
+uni-api/rust/target/
+
+# ============ uni-api 上游 git 历史（恢复方法：改名为 uni-api/.git）============
+/_uniapi_git_backup/
+
+# ============ IDE/系统 ============
+.DS_Store
+Thumbs.db

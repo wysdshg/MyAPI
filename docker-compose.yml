@@ -1,0 +1,10 @@
+services:
+  uni-api:
+    container_name: uni-api
+    image: yym68686/uni-api:latest
+    restart: unless-stopped          # 开机/崩溃后自动拉起
+    ports:
+      - "8001:8000"                  # 对外地址 http://localhost:8001/v1
+    volumes:
+      - ./api.yaml:/home/api.yaml    # 配置文件挂载，改完 docker compose restart 即可
+      - ./uniapi_db:/home/data       # 数据目录（用量统计等）

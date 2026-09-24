@@ -1,0 +1,123 @@
+name: Build and Release PEX
+
+on:
+  workflow_run:
+    workflows: ["Docker Build and Publish Docker Image"]
+    types:
+      - completed
+
+jobs:
+  build:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            arch: x86_64
+          - os: macos-latest
+            platform: macos
+            arch: arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pex
+        run: pip install pex
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.0"
+
+      - name: Generate requirements.txt
+        run: uv export --frozen --no-dev --no-emit-project --output-file requirements.txt
+
+      - name: Install dependencies with uv
+        run: uv pip install -r requirements.txt
+        env:
+          UV_SYSTEM_PYTHON: 1
+
+      - name: Get Version
+        id: get_version
+        run: |
+          VERSION=$(grep "^version = " pyproject.toml | awk -F'"' '{print $2}')
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Prepare PEX sources
+        run: |
+          rm -rf pex-src
+          mkdir -p pex-src
+          cp main.py upstream.py utils.py routing.py db.py fugue_observability.py pyproject.toml pex-src/
+          cp -R core uni_api video static pex-src/
+          find pex-src -name '__pycache__' -type d -prune -exec rm -rf {} +
+          find pex-src -name '*.pyc' -delete
+          find pex-src -name '.git' -prune -exec rm -rf {} +
+
+      - name: Build Linux PEX
+        if: matrix.platform == 'linux'
+        run: |
+          pex -D pex-src -r requirements.txt \
+          -m main \
+          --interpreter-constraint '==3.11.*' \
+          --no-strip-pex-env \
+          -o uni-api-linux-x86_64-${VERSION}.pex
+
+      - name: Build MacOS PEX
+        if: matrix.platform == 'macos'
+        run: |
+          pex -D pex-src -r requirements.txt \
+          -m main \
+          --interpreter-constraint '==3.11.*' \
+          -o uni-api-macos-arm64-${VERSION}.pex
+
+      - name: Upload PEX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: uni-api-${{ matrix.platform }}-${{ matrix.arch }}-${{ env.VERSION }}.pex
+          path: uni-api-${{ matrix.platform }}-${{ matrix.arch }}-${{ env.VERSION }}.pex
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Get Version
+        id: get_version
+        run: |
+          VERSION=$(grep "^version = " pyproject.toml | awk -F'"' '{print $2}')
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Download PEX artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: Release ${{ env.VERSION }}
+          draft: false
+          prerelease: false
+          files: |
+            dist/uni-api-linux-x86_64-${{ env.VERSION }}.pex
+            dist/uni-api-macos-arm64-${{ env.VERSION }}.pex
