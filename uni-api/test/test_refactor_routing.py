@@ -339,7 +339,7 @@ def test_model_request_handler_passes_selected_provider_key(monkeypatch):
         async def is_all_rate_limited(self, model):
             return False
 
-        async def next(self, model):
+        async def next(self, model, *args, **kwargs):
             return "provider-key-1"
 
         def get_items_count(self):
@@ -426,7 +426,7 @@ def test_model_request_semantic_context_error_returns_400_without_retry_or_coold
         async def is_all_rate_limited(self, model):
             return False
 
-        async def next(self, model):
+        async def next(self, model, *args, **kwargs):
             return self.key
 
         def get_items_count(self):
@@ -587,7 +587,7 @@ def test_model_request_same_turn_disconnect_closes_completed_stream_result(
         async def is_all_rate_limited(self, model):
             return False
 
-        async def next(self, model):
+        async def next(self, model, *args, **kwargs):
             return "provider-key-1"
 
         def get_items_count(self):
@@ -674,7 +674,7 @@ def test_model_request_handler_error_log_includes_request_and_actual_model(monke
         async def is_all_rate_limited(self, model):
             return False
 
-        async def next(self, model):
+        async def next(self, model, *args, **kwargs):
             return "provider-key-1"
 
         def get_items_count(self):

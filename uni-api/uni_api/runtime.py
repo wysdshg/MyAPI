@@ -62,7 +62,7 @@ from uni_api.routing.planner import (
     get_right_order_providers,
     select_provider_api_key_raw,
 )
-from uni_api.routing.core import extract_provider_key_index
+from uni_api.routing.core import extract_provider_key_index, estimate_request_tokens
 from uni_api.routing.request_rules import request_reasoning_effort
 from uni_api.routing.request_types import detect_request_type
 from upstream import (
@@ -4460,6 +4460,7 @@ class ModelRequestHandler:
             attempt.provider_api_key_raw = await runner.select_provider_api_key(
                 attempt,
                 provider_key_index=extract_provider_key_index(original_request_model),
+                estimated_tokens=estimate_request_tokens(original_request_model),
             )
             attempt_provider = dict(provider)
             attempt_provider["_routing_attempt_id"] = (
@@ -7518,6 +7519,7 @@ class ResponsesRequestExecution:
         attempt.provider_api_key_raw = await self.runner.select_provider_api_key(
             attempt,
             provider_key_index=extract_provider_key_index(self.request_data, self.http_request),
+            estimated_tokens=estimate_request_tokens(self.request_data),
         )
         if isinstance(self.current_info, dict):
             self.current_info["provider_api_key"] = attempt.provider_api_key_raw
@@ -9868,6 +9870,7 @@ class MessagesPassthroughHandler:
             provider_key_index=extract_provider_key_index(
                 raw_body=ctx.get("request_body"), http_request=ctx.get("http_request")
             ),
+            estimated_tokens=estimate_request_tokens(ctx.get("request_body")),
         )
         if isinstance(ctx.get("current_info"), dict):
             ctx["current_info"]["provider_api_key"] = attempt.provider_api_key_raw
@@ -10859,6 +10862,7 @@ class VideoTaskHandler:
             provider_key_index=extract_provider_key_index(
                 raw_body=ctx.get("request_body"), http_request=ctx.get("http_request")
             ),
+            estimated_tokens=estimate_request_tokens(ctx.get("request_body")),
         )
         adapter = _video_adapter_for(provider, provider_name)
         try:
@@ -11234,6 +11238,7 @@ class LingjingOpenapiHandler:
             provider_key_index=extract_provider_key_index(
                 raw_body=ctx.get("request_body"), http_request=ctx.get("http_request")
             ),
+            estimated_tokens=estimate_request_tokens(ctx.get("request_body")),
         )
         timeout_value = get_preference(
             app.state.provider_timeouts,

@@ -917,10 +917,13 @@ class UpstreamRunner:
         attempt: UpstreamAttemptContext,
         *,
         provider_key_index: Optional[int] = None,
+        estimated_tokens: int = 0,
     ) -> Optional[str]:
-        selector_kwargs = (
-            {} if provider_key_index is None else {"provider_key_index": provider_key_index}
-        )
+        selector_kwargs: dict = {}
+        if provider_key_index is not None:
+            selector_kwargs["provider_key_index"] = provider_key_index
+        if estimated_tokens and estimated_tokens > 0:
+            selector_kwargs["estimated_tokens"] = int(estimated_tokens)
         attempt.provider_api_key_raw = await self.provider_api_key_selector(
             attempt.provider,
             attempt.original_model,

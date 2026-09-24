@@ -105,7 +105,13 @@ class ProviderKeyPool:
     def rollback_rate_limit_record(self, item: str, model: str | None = None) -> None:
         self.state.rollback_last_record(item, model)
 
-    async def next(self, model: str | None = None, *, provider_key_index: int | None = None):
+    async def next(
+        self,
+        model: str | None = None,
+        *,
+        provider_key_index: int | None = None,
+        estimated_tokens: int = 0,
+    ):
         async with self.lock:
             if not self.items:
                 self._log_warning("All API keys are rate limited!")
@@ -131,7 +137,11 @@ class ProviderKeyPool:
 
                 # 额度/token 窗口优先于请求限流检查：不可用的 Key 直接跳过，
                 # 不消耗它的请求计数；可用的 Key 选中即预扣当日额度。
-                quota_reason = quota.block_reason(item, model) if quota is not None else None
+                quota_reason = (
+                    quota.block_reason(item, model, estimated_tokens=estimated_tokens)
+                    if quota is not None
+                    else None
+                )
                 if quota_reason is not None:
                     block_detail = block_detail or quota_reason
                 elif not self.state.is_rate_limited(item, model, self.policy, commit=True):

@@ -650,18 +650,49 @@ async def select_provider_api_key_raw(
     api_list: list[str],
     *,
     provider_key_index: Optional[int] = None,
+    estimated_tokens: int = 0,
 ) -> Optional[str]:
     provider_name = provider["provider"]
     if provider_name.startswith("sk-") and provider_name in api_list:
         return provider_name
     if provider.get("api"):
-        next_kwargs = (
-            {} if provider_key_index is None else {"provider_key_index": provider_key_index}
-        )
+        next_kwargs: dict = {}
+        if provider_key_index is not None:
+            next_kwargs["provider_key_index"] = provider_key_index
+        if estimated_tokens and estimated_tokens > 0:
+            next_kwargs["estimated_tokens"] = int(estimated_tokens)
         return await provider_api_circular_list[provider_name].next(
             original_model, **next_kwargs
         )
     return None
+
+
+def estimate_request_tokens(request: Any = None) -> int:
+    """粗估请求 prompt 的 token 数（发送前预算，宁多勿少）。
+
+    中英混合按 字符数//2 估算：中文约 1.5~2 字符/token（略偏多），英文约
+    4 字符/token（偏多一倍）——方向安全，只会提前跳 Key 不会漏放。
+    返回值空间由 TOKEN_SOFT_LIMIT（如 47000，低于窗口上限 49000）预留。
+    支持 RequestModel 或已解析的 dict（如 ctx["request_body"]）。
+    """
+    if request is None:
+        return 0
+    try:
+        import json as _json
+
+        if isinstance(request, dict):
+            payload: dict = {"messages": request.get("messages") or []}
+            if request.get("tools"):
+                payload["tools"] = request.get("tools")
+        else:
+            payload = {"messages": getattr(request, "messages", None) or []}
+            tools = getattr(request, "tools", None)
+            if tools:
+                payload["tools"] = tools
+        text = _json.dumps(payload, ensure_ascii=False, default=str)
+        return max(len(text) // 2, 8)
+    except Exception:
+        return 0
 
 
 def extract_provider_key_index(

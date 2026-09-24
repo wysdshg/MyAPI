@@ -162,6 +162,7 @@ class ProviderQuota:
         model_cost: Mapping[str, float] | None = None,
         default_cost: float = DEFAULT_COST,
         token_rules: tuple[tuple[int, int], ...] = (),
+        token_soft_limit: int | None = None,
         store: QuotaStore | None = None,
         today_func: Callable[[], str] | None = None,
         now_func: Callable[[], float] | None = None,
@@ -171,6 +172,8 @@ class ProviderQuota:
         self.model_cost = dict(model_cost or {})
         self.default_cost = default_cost
         self.token_rules = tuple(token_rules)
+        # 软上限：已用+预估 ≥ 软上限就跳过该 Key（TOKEN_SOFT_LIMIT，稳态保护）
+        self.token_soft_limit = token_soft_limit
         if store is None and daily_quota is not None:
             store = QuotaStore.get()
         self.store = store
@@ -188,6 +191,7 @@ class ProviderQuota:
             tuple(sorted(self.model_cost.items())),
             self.default_cost,
             self.token_rules,
+            self.token_soft_limit,
             str(self.store.path) if self.store is not None else None,
         )
 
@@ -252,12 +256,27 @@ class ProviderQuota:
         if token_raw is not None and not token_rules:
             logger.warning("provider %s: TOKEN_RATE_LIMIT 无效 %r，已忽略", name, token_raw)
 
+        token_soft_limit: int | None = None
+        soft_raw = prefs.get("TOKEN_SOFT_LIMIT")
+        if soft_raw is not None:
+            try:
+                token_soft_limit = int(float(soft_raw))
+            except (TypeError, ValueError):
+                logger.warning("provider %s: TOKEN_SOFT_LIMIT 无效 %r，已忽略", name, soft_raw)
+            else:
+                if token_soft_limit <= 0:
+                    logger.warning(
+                        "provider %s: TOKEN_SOFT_LIMIT 必须大于 0，已忽略", name, soft_raw
+                    )
+                    token_soft_limit = None
+
         return cls(
             name,
             daily_quota=daily_quota,
             model_cost=model_cost,
             default_cost=default_cost,
             token_rules=token_rules,
+            token_soft_limit=token_soft_limit,
             store=store,
             today_func=today_func,
             now_func=now_func,
@@ -268,8 +287,18 @@ class ProviderQuota:
             return self.model_cost[model]
         return self.default_cost
 
-    def block_reason(self, key: str, model: str | None = None) -> str | None:
-        """该账号 Key 当前不可用时返回具体原因，可用时返回 None。"""
+    def block_reason(
+        self,
+        key: str,
+        model: str | None = None,
+        estimated_tokens: int = 0,
+    ) -> str | None:
+        """该账号 Key 当前不可用时返回具体原因，可用时返回 None。
+
+        estimated_tokens：请求前对本次 prompt 的预估 token 数（粗估，宁多勿少）。
+        配置了 TOKEN_SOFT_LIMIT 时，已用+预估 ≥ 软上限就判定该 Key 不可用，
+        由轮换逻辑自动跳到窗口还有余量的下一把 Key。
+        """
         if self.daily_quota is not None and self.store is not None:
             today = self._today()
             spent = self.store.spent(self.provider_name, today, _key_hash(key))
@@ -283,6 +312,14 @@ class ProviderQuota:
             now = self._now()
             for limit, period in self.token_rules:
                 used = self._window_used(key_hash, period, now)
+                projected = used + max(0, estimated_tokens)
+                if self.token_soft_limit and projected >= self.token_soft_limit:
+                    return (
+                        f"Token soft limit for {self.provider_name} "
+                        f"(used {int(used)} + estimated {int(max(0, estimated_tokens))} "
+                        f">= {self.token_soft_limit} tokens per {period}s sliding window), "
+                        f"skip key"
+                    )
                 if used >= limit:
                     return (
                         f"Token rate limit for {self.provider_name} "

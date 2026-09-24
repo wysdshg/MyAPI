@@ -44,7 +44,7 @@ async def prepare_provider_request(
     original_model = model_dict[request.model]
     # 请求级上游 Key 选择（body 字段 provider_key_index / X-Key-Index 头）；
     # 读取即从请求中移除，避免该字段被透传给上游供应商。
-    from uni_api.routing.core import extract_provider_key_index
+    from uni_api.routing.core import estimate_request_tokens, extract_provider_key_index
 
     request_key_index = extract_provider_key_index(request, http_request)
     if provider_api_key_raw is None:
@@ -53,6 +53,7 @@ async def prepare_provider_request(
             original_model,
             runtime_api_list,
             provider_key_index=request_key_index,
+            estimated_tokens=estimate_request_tokens(request),
         )
 
     engine, stream_mode = get_engine(provider, endpoint, original_model)
