@@ -105,7 +105,7 @@ class ProviderKeyPool:
     def rollback_rate_limit_record(self, item: str, model: str | None = None) -> None:
         self.state.rollback_last_record(item, model)
 
-    async def next(self, model: str | None = None):
+    async def next(self, model: str | None = None, *, provider_key_index: int | None = None):
         async with self.lock:
             if not self.items:
                 self._log_warning("All API keys are rate limited!")
@@ -116,6 +116,11 @@ class ProviderKeyPool:
 
             if self.schedule_algorithm == "smart_round_robin" and self.index == len(self.items) - 1:
                 self._trigger_reorder()
+
+            # 请求级指定上游 Key：body 字段 provider_key_index 或 X-Key-Index 头，
+            # 0,1,2,... 选择该渠道第几个 Key，越界自动取模（3 个 Key 传 5 => 第 2 个）。
+            if provider_key_index is not None:
+                self.index = int(provider_key_index) % len(self.items)
 
             start_index = self.index
             quota = self.quota

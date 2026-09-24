@@ -648,13 +648,48 @@ async def select_provider_api_key_raw(
     provider: dict,
     original_model: str,
     api_list: list[str],
+    *,
+    provider_key_index: Optional[int] = None,
 ) -> Optional[str]:
     provider_name = provider["provider"]
     if provider_name.startswith("sk-") and provider_name in api_list:
         return provider_name
     if provider.get("api"):
-        return await provider_api_circular_list[provider_name].next(original_model)
+        next_kwargs = (
+            {} if provider_key_index is None else {"provider_key_index": provider_key_index}
+        )
+        return await provider_api_circular_list[provider_name].next(
+            original_model, **next_kwargs
+        )
     return None
+
+
+def extract_provider_key_index(
+    request: Any = None,
+    http_request: Any = None,
+    raw_body: Any = None,
+) -> Optional[int]:
+    """读取请求级上游 Key 选择参数：body 字段 provider_key_index 或 X-Key-Index 请求头。
+
+    返回 None 表示未指定（走渠道默认调度）；指定时返回非负 int。
+    body 字段读取后立即从请求模型 extras / 原始 body 字典中移除，避免透传给上游。
+    """
+    value: Any = None
+    if isinstance(raw_body, dict):
+        value = raw_body.pop("provider_key_index", None)
+    if value is None and request is not None:
+        value = getattr(request, "provider_key_index", None)
+        extras = getattr(request, "__pydantic_extra__", None)
+        if isinstance(extras, dict):
+            extras.pop("provider_key_index", None)
+    if value is None and http_request is not None:
+        value = http_request.headers.get("x-key-index")
+    if value is None:
+        return None
+    try:
+        return abs(int(value))
+    except (TypeError, ValueError):
+        return None
 
 
 async def compute_start_index(

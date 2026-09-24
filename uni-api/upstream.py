@@ -912,11 +912,20 @@ class UpstreamRunner:
             original_model=attempt.original_model,
         )
 
-    async def select_provider_api_key(self, attempt: UpstreamAttemptContext) -> Optional[str]:
+    async def select_provider_api_key(
+        self,
+        attempt: UpstreamAttemptContext,
+        *,
+        provider_key_index: Optional[int] = None,
+    ) -> Optional[str]:
+        selector_kwargs = (
+            {} if provider_key_index is None else {"provider_key_index": provider_key_index}
+        )
         attempt.provider_api_key_raw = await self.provider_api_key_selector(
             attempt.provider,
             attempt.original_model,
             self._runtime_api_list(),
+            **selector_kwargs,
         )
         return attempt.provider_api_key_raw
 

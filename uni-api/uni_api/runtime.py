@@ -62,6 +62,7 @@ from uni_api.routing.planner import (
     get_right_order_providers,
     select_provider_api_key_raw,
 )
+from uni_api.routing.core import extract_provider_key_index
 from uni_api.routing.request_rules import request_reasoning_effort
 from uni_api.routing.request_types import detect_request_type
 from upstream import (
@@ -4456,7 +4457,10 @@ class ModelRequestHandler:
             if keepalive_interval > local_timeout_value or provider_name.startswith("sk-"):
                 keepalive_interval = None
 
-            attempt.provider_api_key_raw = await runner.select_provider_api_key(attempt)
+            attempt.provider_api_key_raw = await runner.select_provider_api_key(
+                attempt,
+                provider_key_index=extract_provider_key_index(original_request_model),
+            )
             attempt_provider = dict(provider)
             attempt_provider["_routing_attempt_id"] = (
                 attempt.routing_attempt_id
@@ -7511,7 +7515,10 @@ class ResponsesRequestExecution:
                 "failure_stage": "auth",
             }
         )
-        attempt.provider_api_key_raw = await self.runner.select_provider_api_key(attempt)
+        attempt.provider_api_key_raw = await self.runner.select_provider_api_key(
+            attempt,
+            provider_key_index=extract_provider_key_index(self.request_data, self.http_request),
+        )
         if isinstance(self.current_info, dict):
             self.current_info["provider_api_key"] = attempt.provider_api_key_raw
         _mark_current_info_stage(self.current_info, "provider_key_selected")
@@ -9856,7 +9863,12 @@ class MessagesPassthroughHandler:
                 "failure_stage": "auth",
             }
         )
-        attempt.provider_api_key_raw = await ctx["runner"].select_provider_api_key(attempt)
+        attempt.provider_api_key_raw = await ctx["runner"].select_provider_api_key(
+            attempt,
+            provider_key_index=extract_provider_key_index(
+                raw_body=ctx.get("request_body"), http_request=ctx.get("http_request")
+            ),
+        )
         if isinstance(ctx.get("current_info"), dict):
             ctx["current_info"]["provider_api_key"] = attempt.provider_api_key_raw
         timeout_value = get_preference(
@@ -10842,7 +10854,12 @@ class VideoTaskHandler:
         proxy = safe_get(ctx["config"], "preferences", "proxy", default=None)
         proxy = safe_get(provider, "preferences", "proxy", default=proxy)
         attempt.state["failure_stage"] = "auth"
-        attempt.provider_api_key_raw = await ctx["runner"].select_provider_api_key(attempt)
+        attempt.provider_api_key_raw = await ctx["runner"].select_provider_api_key(
+            attempt,
+            provider_key_index=extract_provider_key_index(
+                raw_body=ctx.get("request_body"), http_request=ctx.get("http_request")
+            ),
+        )
         adapter = _video_adapter_for(provider, provider_name)
         try:
             upstream_request = adapter.build_request(
@@ -11212,7 +11229,12 @@ class LingjingOpenapiHandler:
         proxy = safe_get(ctx["config"], "preferences", "proxy", default=None)
         proxy = safe_get(provider, "preferences", "proxy", default=proxy)
         attempt.state.update({"upstream_url": upstream_url, "channel_id": f"{provider_name}", "proxy": proxy, "failure_stage": "auth"})
-        attempt.provider_api_key_raw = await ctx["runner"].select_provider_api_key(attempt)
+        attempt.provider_api_key_raw = await ctx["runner"].select_provider_api_key(
+            attempt,
+            provider_key_index=extract_provider_key_index(
+                raw_body=ctx.get("request_body"), http_request=ctx.get("http_request")
+            ),
+        )
         timeout_value = get_preference(
             app.state.provider_timeouts,
             provider_name,
