@@ -52,12 +52,17 @@ def save_config(data: dict) -> None:
         yaml.dump(data, f)
 
 
-def normalize_providers(raw: list, existing: list | None = None) -> list:
+def normalize_providers(raw: list, existing: list | None = None) -> tuple[list, list]:
     """把前端提交的渠道列表整理成 api.yaml 的结构。
 
     existing 是当前 api.yaml 里的渠道列表：同名渠道保留原有字段
     （preferences、headers、region 等手工添加的配置不会被保存清掉），
     只覆盖表单里编辑的 provider/base_url/api/model 四项。
+
+    返回 (providers, warnings)：
+    - 全空卡片（名字、URL、Key 都没填）视为误点"添加渠道"，直接忽略；
+    - 填了一半的卡片不再静默丢弃，生成中文警告让前端弹出提示；
+    - 渠道名相同的卡片自动合并（Key 与模型映射取并集），不产生重复渠道。
     """
     old_by_name: dict = {}
     for old in existing or []:
@@ -65,16 +70,11 @@ def normalize_providers(raw: list, existing: list | None = None) -> list:
         if old_name and old_name not in old_by_name:
             old_by_name[old_name] = old
 
-    providers = []
-    for item in raw or []:
-        name = str(item.get("provider") or "").strip()
-        base_url = str(item.get("base_url") or "").strip()
-        if not name or not base_url:
-            continue
-        keys = [k.strip() for k in (item.get("keys") or []) if str(k).strip()]
-        if not keys:
-            continue
-        api_value = keys[0] if len(keys) == 1 else keys
+    warnings: list = []
+    merged: dict = {}
+    order: list = []
+
+    def parse_models(item) -> list:
         mapping = []
         for line in item.get("models") or []:
             text = str(line).strip()
@@ -88,6 +88,35 @@ def normalize_providers(raw: list, existing: list | None = None) -> list:
                 mapping.append(external)          # 同名: 纯字符串
             else:
                 mapping.append({upstream: external})  # 官方语义 {上游名: 对外名}
+        return mapping
+
+    for item in raw or []:
+        name = str(item.get("provider") or "").strip()
+        base_url = str(item.get("base_url") or "").strip()
+        keys = [k.strip() for k in (item.get("keys") or []) if str(k).strip()]
+        if not name and not base_url and not keys:
+            continue  # 全空卡片：用户误点"添加渠道"，忽略
+        if not name:
+            preview = (keys[0][:8] + "…") if keys else "无"
+            warnings.append(f"有一张渠道卡片没填「渠道名」（Key: {preview}），未保存")
+            continue
+        if not base_url:
+            warnings.append(f"渠道「{name}」没填 Base URL，未保存")
+            continue
+        if not keys:
+            warnings.append(f"渠道「{name}」没填任何 API Key，未保存")
+            continue
+        mapping = parse_models(item)
+        if name in merged:
+            # 同名合并：Key 与模型映射取并集，顺序保持先出现者优先
+            base = merged[name]
+            old_keys = base["api"] if isinstance(base["api"], list) else [base["api"]]
+            base["api"] = old_keys + [k for k in keys if k not in old_keys]
+            base_models = base["model"]
+            for m in mapping:
+                if m not in base_models:
+                    base_models.append(m)
+            continue
         old = old_by_name.get(name, {})
         provider = {
             key: value
@@ -99,7 +128,7 @@ def normalize_providers(raw: list, existing: list | None = None) -> list:
             {
                 "provider": name,
                 "base_url": base_url,
-                "api": api_value,
+                "api": keys[0] if len(keys) == 1 else keys,
                 "model": mapping or ["gpt-4o-mini"],
             }
         )
@@ -108,8 +137,11 @@ def normalize_providers(raw: list, existing: list | None = None) -> list:
         preferences = dict(old.get("preferences") or {})
         preferences["AUTO_RETRY"] = bool(item.get("auto_retry", True))
         provider["preferences"] = preferences
-        providers.append(provider)
-    return providers
+        merged[name] = provider
+        order.append(name)
+
+    providers = [merged[n] for n in order]
+    return providers, warnings
 
 
 def normalize_api_keys(raw: list, existing: list | None = None) -> list:
@@ -263,12 +295,14 @@ def get_config():
 @app.post("/api/config")
 def post_config(payload: dict):
     data = load_config()
-    data["providers"] = normalize_providers(payload.get("providers"), data.get("providers"))
+    data["providers"], warnings = normalize_providers(
+        payload.get("providers"), data.get("providers")
+    )
     data["api_keys"] = normalize_api_keys(payload.get("api_keys"), data.get("api_keys"))
     if not data["providers"]:
         return JSONResponse({"error": "至少需要一个渠道"}, status_code=400)
     save_config(data)
-    return {"saved": True}
+    return {"saved": True, "warnings": warnings}
 
 
 @app.post("/api/server/{action}")
@@ -481,6 +515,9 @@ async function save() {
     headers: {'Content-Type': 'application/json'}, body: JSON.stringify(collect())});
   const j = await r.json();
   document.getElementById('saveMsg').textContent = j.saved ? '已保存 ✓' : ('失败: ' + j.error);
+  if (j.warnings && j.warnings.length)
+    alert('以下内容没有保存：\n' + j.warnings.join('\n') +
+      '\n\n（同名渠道的多张卡片会自动合并 Key；全空卡片直接忽略）');
   setTimeout(() => document.getElementById('saveMsg').textContent = '', 3000);
   return j.saved;
 }
