@@ -40,16 +40,30 @@ app = FastAPI()
 
 # ---------------- 配置读写 ----------------
 
+# api.yaml 落库加密（DPAPI）：读时自动解密，写时自动加密，明文不落盘
+sys.path.insert(0, str(BASE / "uni-api"))
+import keyvault  # noqa: E402
+
+
 def load_config() -> dict:
     with open(CONFIG_PATH, encoding="utf-8") as f:
-        return yaml.load(f) or {}
+        return yaml.load(keyvault.open_text(f.read())) or {}
 
 
 def save_config(data: dict) -> None:
+    import io
+
+    stream = io.StringIO()
+    yaml.dump(data, stream)
+    sealed = keyvault.seal_text(stream.getvalue())
+    # 备份文件同样保存密文（.bak 里绝不允许出现明文 Key）
     backup = CONFIG_PATH.with_suffix(".yaml.bak")
-    backup.write_text(CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    try:
+        backup.write_text(keyvault.seal_text(CONFIG_PATH.read_text(encoding="utf-8")), encoding="utf-8")
+    except OSError:
+        pass
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        yaml.dump(data, f)
+        f.write(sealed)
 
 
 def normalize_providers(raw: list, existing: list | None = None) -> tuple[list, list]:

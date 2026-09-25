@@ -27,10 +27,37 @@ yaml.indent(mapping=2, sequence=4, offset=2)
 API_YAML_PATH = "./api.yaml"
 yaml_error_message = None
 
+# api.yaml 落库加密（DPAPI）。keyvault.py 与本文件同在 uni-api/ 目录下。
+try:
+    import keyvault as _keyvault
+except ImportError:  # 兜底：模块缺失时按明文读取，行为与旧版一致
+    _keyvault = None
+
+
+def _read_yaml_text(raw_text: str):
+    """解密（若是密文）并解析 YAML；解密失败返回 None 并记录原因。"""
+    if _keyvault is not None and _keyvault.is_sealed(raw_text):
+        try:
+            raw_text = _keyvault.open_text(raw_text)
+        except Exception as exc:
+            global yaml_error_message
+            yaml_error_message = f"api.yaml 解密失败：{exc}"
+            logger.error(yaml_error_message)
+            return None
+    return yaml.load(raw_text)
+
 
 def save_api_yaml(config_data: dict[str, Any], path: str | Path = API_YAML_PATH) -> None:
+    """写配置文件：落盘前统一 DPAPI 加密，明文不落盘。"""
+    import io
+
+    stream = io.StringIO()
+    yaml.dump(config_data, stream)
+    text = stream.getvalue()
+    if _keyvault is not None:
+        text = _keyvault.seal_text(text)
     with open(path, "w", encoding="utf-8") as file:
-        yaml.dump(config_data, file)
+        file.write(text)
 
 
 async def update_config(config_data: dict[str, Any], use_config_url: bool = False):
@@ -152,7 +179,8 @@ async def load_config(app=None):
     api_list: list[str]
     try:
         with open(API_YAML_PATH, "r", encoding="utf-8") as file:
-            conf = yaml.load(file)
+            raw_text = file.read()
+        conf = _read_yaml_text(raw_text)
 
         if conf:
             config, api_keys_db, api_list = await update_config(conf, use_config_url=False)
