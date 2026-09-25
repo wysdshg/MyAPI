@@ -651,6 +651,7 @@ async def select_provider_api_key_raw(
     *,
     provider_key_index: Optional[int] = None,
     estimated_tokens: int = 0,
+    allow_wait: bool = True,
 ) -> Optional[str]:
     provider_name = provider["provider"]
     if provider_name.startswith("sk-") and provider_name in api_list:
@@ -661,6 +662,8 @@ async def select_provider_api_key_raw(
             next_kwargs["provider_key_index"] = provider_key_index
         if estimated_tokens and estimated_tokens > 0:
             next_kwargs["estimated_tokens"] = int(estimated_tokens)
+        if not allow_wait:
+            next_kwargs["allow_wait"] = False
         return await provider_api_circular_list[provider_name].next(
             original_model, **next_kwargs
         )

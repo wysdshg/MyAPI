@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 from typing import Any, Callable
 
 from fastapi import HTTPException
@@ -105,56 +106,130 @@ class ProviderKeyPool:
     def rollback_rate_limit_record(self, item: str, model: str | None = None) -> None:
         self.state.rollback_last_record(item, model)
 
+    async def _select_locked(
+        self,
+        model: str | None = None,
+        *,
+        provider_key_index: int | None = None,
+        estimated_tokens: int = 0,
+    ) -> tuple[str | None, str | None]:
+        """轮换选一把可用 Key。调用方必须已持有 self.lock。
+
+        返回 (key, block_detail)：全部不可用时 key=None，block_detail 为
+        第一条不可用原因（Token/Daily 开头的是额度类原因）。
+        """
+        if self.schedule_algorithm == "fixed_priority":
+            self.index = 0
+
+        if self.schedule_algorithm == "smart_round_robin" and self.index == len(self.items) - 1:
+            self._trigger_reorder()
+
+        # 请求级指定上游 Key：body 字段 provider_key_index 或 X-Key-Index 头，
+        # 0,1,2,... 选择该渠道第几个 Key，越界自动取模（3 个 Key 传 5 => 第 2 个）。
+        if provider_key_index is not None:
+            self.index = int(provider_key_index) % len(self.items)
+
+        start_index = self.index
+        quota = self.quota
+        block_detail: str | None = None
+        while True:
+            item = self.items[self.index]
+            self.index = (self.index + 1) % len(self.items)
+
+            # 额度/token 窗口优先于请求限流检查：不可用的 Key 直接跳过，
+            # 不消耗它的请求计数；可用的 Key 选中即预扣当日额度。
+            quota_reason = (
+                quota.block_reason(item, model, estimated_tokens=estimated_tokens)
+                if quota is not None
+                else None
+            )
+            if quota_reason is not None:
+                block_detail = block_detail or quota_reason
+            elif not self.state.is_rate_limited(item, model, self.policy, commit=True):
+                if quota is not None:
+                    quota.charge(item, model)
+                return item, None
+
+            if self.index == start_index:
+                return None, block_detail
+
     async def next(
         self,
         model: str | None = None,
         *,
         provider_key_index: int | None = None,
         estimated_tokens: int = 0,
+        allow_wait: bool = True,
     ):
+        if not self.items:
+            self._log_warning("All API keys are rate limited!")
+            raise HTTPException(status_code=429, detail="Too many requests")
+
         async with self.lock:
-            if not self.items:
-                self._log_warning("All API keys are rate limited!")
-                raise HTTPException(status_code=429, detail="Too many requests")
+            item, block_detail = await self._select_locked(
+                model,
+                provider_key_index=provider_key_index,
+                estimated_tokens=estimated_tokens,
+            )
+        if item is not None:
+            return item
 
-            if self.schedule_algorithm == "fixed_priority":
-                self.index = 0
+        # 全部 Key 都被额度类原因挡下。仅当原因是 token 窗口（会随滑动窗口
+        # 推移而缓解）且配置了 TOKEN_WAIT_SECONDS 时，进入有界 FIFO 等待；
+        # 每日额度耗尽等长期原因不等待，立即 429。
+        quota = self.quota
+        wait_seconds = int(getattr(quota, "token_wait_seconds", 0) or 0)
+        token_kind = bool(block_detail) and block_detail.startswith("Token")
+        if not (allow_wait and quota is not None and wait_seconds > 0 and token_kind):
+            if block_detail:
+                self._log_warning(f"All API keys unavailable: {block_detail}")
+                raise HTTPException(status_code=429, detail=block_detail)
+            self._log_warning("All API keys are rate limited!")
+            raise HTTPException(status_code=429, detail="Too many requests")
 
-            if self.schedule_algorithm == "smart_round_robin" and self.index == len(self.items) - 1:
-                self._trigger_reorder()
-
-            # 请求级指定上游 Key：body 字段 provider_key_index 或 X-Key-Index 头，
-            # 0,1,2,... 选择该渠道第几个 Key，越界自动取模（3 个 Key 传 5 => 第 2 个）。
-            if provider_key_index is not None:
-                self.index = int(provider_key_index) % len(self.items)
-
-            start_index = self.index
-            quota = self.quota
-            block_detail: str | None = None
+        ticket = quota.wait_enter()
+        if ticket is None:
+            detail = (
+                f"Token window for {quota.provider_name} full and wait queue full "
+                f"(max {quota.token_wait_queue_max} waiting), retry later"
+            )
+            self._log_warning(detail)
+            raise HTTPException(status_code=429, detail=detail, headers={"Retry-After": "5"})
+        try:
+            deadline = time.monotonic() + wait_seconds
+            poll_interval = 1.0
             while True:
-                item = self.items[self.index]
-                self.index = (self.index + 1) % len(self.items)
-
-                # 额度/token 窗口优先于请求限流检查：不可用的 Key 直接跳过，
-                # 不消耗它的请求计数；可用的 Key 选中即预扣当日额度。
-                quota_reason = (
-                    quota.block_reason(item, model, estimated_tokens=estimated_tokens)
-                    if quota is not None
-                    else None
-                )
-                if quota_reason is not None:
-                    block_detail = block_detail or quota_reason
-                elif not self.state.is_rate_limited(item, model, self.policy, commit=True):
-                    if quota is not None:
-                        quota.charge(item, model)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    # 等待超时：带上建议的重试秒数（窗口滑出最早空闲点）
+                    retry_after = 60
+                    for candidate in self.items:
+                        wait_est = quota.seconds_until_token_room(
+                            candidate, model, estimated_tokens=estimated_tokens
+                        )
+                        if wait_est is not None:
+                            retry_after = max(1, min(600, int(wait_est) + 1))
+                            break
+                    detail = (
+                        f"Token window for {quota.provider_name} still full after "
+                        f"waiting {wait_seconds}s (queue position expired)"
+                    )
+                    self._log_warning(detail)
+                    raise HTTPException(
+                        status_code=429, detail=detail, headers={"Retry-After": str(retry_after)}
+                    )
+                if not quota.wait_head(ticket):
+                    await asyncio.sleep(min(poll_interval, remaining))
+                    continue
+                async with self.lock:
+                    item, block_detail = await self._select_locked(
+                        model, estimated_tokens=estimated_tokens
+                    )
+                if item is not None:
                     return item
-
-                if self.index == start_index:
-                    if block_detail is not None:
-                        self._log_warning(f"All API keys unavailable: {block_detail}")
-                        raise HTTPException(status_code=429, detail=block_detail)
-                    self._log_warning("All API keys are rate limited!")
-                    raise HTTPException(status_code=429, detail="Too many requests")
+                await asyncio.sleep(min(poll_interval, remaining))
+        finally:
+            quota.wait_leave(ticket)
 
     async def is_tpr_exceeded(self, model: str | None = None, tokens: int = 0) -> bool:
         async with self.lock:

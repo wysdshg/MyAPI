@@ -3551,6 +3551,8 @@ async def quota_status():
             "daily_quota": quota.daily_quota,
             "model_cost": quota.model_cost,
             "default_cost": quota.default_cost,
+            "token_wait_seconds": quota.token_wait_seconds,
+            "token_wait_queue": quota.wait_queue_depth(),
             "keys": [],
         }
         keys: list = []

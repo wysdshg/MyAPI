@@ -163,6 +163,8 @@ class ProviderQuota:
         default_cost: float = DEFAULT_COST,
         token_rules: tuple[tuple[int, int], ...] = (),
         token_soft_limit: int | None = None,
+        token_wait_seconds: int = 0,
+        token_wait_queue_max: int = 50,
         store: QuotaStore | None = None,
         today_func: Callable[[], str] | None = None,
         now_func: Callable[[], float] | None = None,
@@ -174,6 +176,12 @@ class ProviderQuota:
         self.token_rules = tuple(token_rules)
         # 软上限：已用+预估 ≥ 软上限就跳过该 Key（TOKEN_SOFT_LIMIT，稳态保护）
         self.token_soft_limit = token_soft_limit
+        # 全部 Key 的 token 窗口都满时的有界 FIFO 等待（TOKEN_WAIT_SECONDS，
+        # 0 = 不等待直接 429；TOKEN_WAIT_QUEUE_MAX 限制排队人数防积压）。
+        self.token_wait_seconds = token_wait_seconds
+        self.token_wait_queue_max = token_wait_queue_max
+        self._waiters: deque[Any] = deque()
+        self._waiters_lock = threading.Lock()
         if store is None and daily_quota is not None:
             store = QuotaStore.get()
         self.store = store
@@ -192,6 +200,8 @@ class ProviderQuota:
             self.default_cost,
             self.token_rules,
             self.token_soft_limit,
+            self.token_wait_seconds,
+            self.token_wait_queue_max,
             str(self.store.path) if self.store is not None else None,
         )
 
@@ -270,6 +280,39 @@ class ProviderQuota:
                     )
                     token_soft_limit = None
 
+        token_wait_seconds = 0
+        wait_raw = prefs.get("TOKEN_WAIT_SECONDS")
+        if wait_raw is not None:
+            try:
+                token_wait_seconds = int(float(wait_raw))
+            except (TypeError, ValueError):
+                logger.warning("provider %s: TOKEN_WAIT_SECONDS 无效 %r，已忽略", name, wait_raw)
+                token_wait_seconds = 0
+            else:
+                if token_wait_seconds <= 0:
+                    token_wait_seconds = 0
+                elif token_wait_seconds > 600:
+                    logger.warning(
+                        "provider %s: TOKEN_WAIT_SECONDS 过大(%d)，截断为 600",
+                        name,
+                        token_wait_seconds,
+                    )
+                    token_wait_seconds = 600
+
+        token_wait_queue_max = 50
+        qmax_raw = prefs.get("TOKEN_WAIT_QUEUE_MAX")
+        if qmax_raw is not None:
+            try:
+                token_wait_queue_max = int(float(qmax_raw))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "provider %s: TOKEN_WAIT_QUEUE_MAX 无效 %r，已忽略", name, qmax_raw
+                )
+                token_wait_queue_max = 50
+            else:
+                if token_wait_queue_max <= 0:
+                    token_wait_queue_max = 50
+
         return cls(
             name,
             daily_quota=daily_quota,
@@ -277,6 +320,8 @@ class ProviderQuota:
             default_cost=default_cost,
             token_rules=token_rules,
             token_soft_limit=token_soft_limit,
+            token_wait_seconds=token_wait_seconds,
+            token_wait_queue_max=token_wait_queue_max,
             store=store,
             today_func=today_func,
             now_func=now_func,
@@ -366,6 +411,70 @@ class ProviderQuota:
             # 不在读路径上删除：一条记录可能同时属于更长的窗口
             cutoff = now - period
             return sum(tokens for timestamp, tokens in window if timestamp > cutoff)
+
+    # ---------- token 窗口全满时的有界 FIFO 等待 ----------
+
+    def wait_enter(self) -> Any:
+        """登记一个等待者；队列已满返回 None（调用方直接 429）。"""
+        with self._waiters_lock:
+            if len(self._waiters) >= self.token_wait_queue_max:
+                return None
+            ticket = object()
+            self._waiters.append(ticket)
+            return ticket
+
+    def wait_head(self, ticket: Any) -> bool:
+        """是否轮到该等待者（严格 FIFO：只有队首可以尝试选 Key）。"""
+        with self._waiters_lock:
+            return bool(self._waiters) and self._waiters[0] is ticket
+
+    def wait_leave(self, ticket: Any) -> None:
+        with self._waiters_lock:
+            try:
+                self._waiters.remove(ticket)
+            except ValueError:
+                pass
+
+    def wait_queue_depth(self) -> int:
+        with self._waiters_lock:
+            return len(self._waiters)
+
+    def seconds_until_token_room(
+        self, key: str, model: str | None = None, estimated_tokens: int = 0
+    ) -> float | None:
+        """估算至少等多久该 Key 能通过软上限检查；返回窗口周期作兜底上限。
+
+        仅对配置了 TOKEN_RATE_LIMIT + TOKEN_SOFT_LIMIT 的渠道有意义。
+        """
+        if not self.token_rules or not self.token_soft_limit:
+            return None
+        key_hash = _key_hash(key)
+        now = self._now()
+        est = max(0, int(estimated_tokens))
+        with self._windows_lock:
+            records = sorted(
+                (ts, val) for ts, val in (self._windows.get(key_hash) or ())
+            )
+        best: float | None = None
+        for limit, period in self.token_rules:
+            target = float(self.token_soft_limit) - est
+            in_window = [(ts, val) for ts, val in records if ts > now - period]
+            used_now = sum(val for _, val in in_window)
+            if used_now < target:
+                cand = 0.0
+            else:
+                # 记录 (ts, val) 在 t = ts + period 时刻过期；从旧到新累加过期量，
+                # 找最早的过期点使剩余 used(t) < target。
+                cand = float(period)
+                removed = 0.0
+                for ts, val in in_window:
+                    removed += val
+                    if used_now - removed < target:
+                        cand = max(0.0, ts + period - now)
+                        break
+            if best is None or cand < best:
+                best = cand
+        return best
 
 
 _quota_registry: dict[str, ProviderQuota] = {}

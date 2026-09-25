@@ -47,6 +47,14 @@ async def prepare_provider_request(
     from uni_api.routing.core import estimate_request_tokens, extract_provider_key_index
 
     request_key_index = extract_provider_key_index(request, http_request)
+    # 同一请求对象只允许等待一次：若上游失败被上层重试并重新走到这里，
+    # 第二次不再排队等待（避免重试叠加等待时间），直接快速失败。
+    allow_wait = not bool(getattr(request, "_token_wait_attempted", False))
+    if allow_wait:
+        try:
+            setattr(request, "_token_wait_attempted", True)
+        except Exception:
+            pass
     if provider_api_key_raw is None:
         provider_api_key_raw = await select_provider_api_key_raw(
             provider,
@@ -54,6 +62,7 @@ async def prepare_provider_request(
             runtime_api_list,
             provider_key_index=request_key_index,
             estimated_tokens=estimate_request_tokens(request),
+            allow_wait=allow_wait,
         )
 
     engine, stream_mode = get_engine(provider, endpoint, original_model)
