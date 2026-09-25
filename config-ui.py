@@ -277,9 +277,12 @@ def start_server() -> None:
 
 # ---------------- 接口 ----------------
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 def index():
-    return HTML_PAGE
+    # no-store：防止浏览器缓存旧版页面（历史上两次"保存后消失"都源于此）
+    from fastapi.responses import HTMLResponse
+
+    return HTMLResponse(content=HTML_PAGE, headers={"Cache-Control": "no-store, max-age=0"})
 
 
 @app.get("/api/status")
@@ -387,8 +390,9 @@ def frontend_log(payload: dict):
     try:
         for card in payload.get("cards", []):
             _save_log(
-                f"  [前端内存] 卡片 {card.get('name')!r}: keys={card.get('keys')}"
-            )
+            f"  [前端内存] 卡片 {card.get('name')!r}: keys={card.get('keys')}"
+            + (f" models={card.get('models')}" if card.get("models") is not None else "")
+        )
         if payload.get("js_error"):
             _save_log(f"  [JS报错] {payload['js_error']}")
     except Exception as exc:
@@ -622,7 +626,7 @@ function render(st) {
         <div class="field"><label>API Key（每行一个，多个自动轮询）</label>
           <textarea rows="3" oninput="setKeys(${i},this)">${esc((p.keys||[]).join('\\n'))}</textarea></div>
         <div class="field"><label>模型映射（每行: 对外名: 上游名[: 单次消耗]）</label>
-          <textarea rows="3" oninput="CFG.providers[${i}].models=this.value.split('\\n')">${esc((p.models||[]).join('\\n'))}</textarea></div>
+          <textarea rows="3" oninput="setModels(${i},this)">${esc((p.models||[]).join('\\n'))}</textarea></div>
       </div>
       <div class="row" style="margin-top:8px">
         <div class="field"><label>每日额度（如魔搭 250 魔粒/天，留空不启用）</label>
@@ -643,16 +647,25 @@ window.onerror = function(msg, src, line, col) {
 };
 
 var _lastKeyLog = 0;
-function setKeys(i, el) {
-  CFG.providers[i].keys = el.value.split('\\n');
+function _reportCard(i) {
   var now = Date.now();
   if (now - _lastKeyLog > 1500) { _lastKeyLog = now;
+    var p = CFG.providers[i] || {};
     try { fetch('/api/frontend-log', {method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({cards: [{name: CFG.providers[i].provider,
-        keys: (CFG.providers[i].keys || []).map(function(k) {
+      body: JSON.stringify({cards: [{name: p.provider,
+        keys: (p.keys || []).map(function(k) {
           return k && k.trim() ? (k.slice(0, 5) + '****' + k.slice(-4) + '(长度' + k.length + ')') : '(空行)';
-        })}]})}); } catch (e) {}
+        }),
+        models: (p.models || []).slice()}]})}); } catch (e) {}
   }
+}
+function setKeys(i, el) {
+  CFG.providers[i].keys = el.value.split('\\n');
+  _reportCard(i);
+}
+function setModels(i, el) {
+  CFG.providers[i].models = el.value.split('\\n');
+  _reportCard(i);
 }
 
 function collect() {
@@ -665,9 +678,11 @@ function collect() {
 async function save() {
   try { fetch('/api/frontend-log', {method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({cards: CFG.providers.map(function(p) {
-      return {name: p.provider, keys: (p.keys || []).map(function(k) {
-        return k && k.trim() ? (k.slice(0, 5) + '****' + k.slice(-4)) : '(空)';
-      })};
+      return {name: p.provider,
+        keys: (p.keys || []).map(function(k) {
+          return k && k.trim() ? (k.slice(0, 5) + '****' + k.slice(-4)) : '(空)';
+        }),
+        models: (p.models || []).slice()};
     })})}); } catch (e) {}
   const r = await fetch('/api/config', {method: 'POST',
     headers: {'Content-Type': 'application/json'}, body: JSON.stringify(collect())});
@@ -680,10 +695,10 @@ async function save() {
   return j.saved;
 }
 
-async function saveAndRestart() { if (await save()) serverAct('restart'); }
+async function saveAndRestart() { if (await save()) serverAct('restart', true); }
 
-async function serverAct(act) {
-  await save();
+async function serverAct(act, skipSave) {
+  if (!skipSave) await save();
   const r = await fetch('/api/server/' + act, {method: 'POST'});
   const j = await r.json();
   if (j.message) alert(j.message);
