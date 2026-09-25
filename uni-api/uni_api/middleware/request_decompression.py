@@ -56,6 +56,7 @@ JSON_BODY_PATHS = frozenset(
         "/v1/asset-groups",
         "/v1/assets",
         "/v1/embeddings",
+        "/v1/rerank",
         "/v1/audio/speech",
         "/v1/moderations",
         "/v1/api_config/update",

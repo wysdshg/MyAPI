@@ -11714,6 +11714,107 @@ async def embeddings(
 ):
     return await embeddings_response(model_handler, request, api_index, background_tasks, http_request=http_request)
 
+@app.post("/v1/rerank", dependencies=[Depends(rate_limit_dependency)])
+async def rerank_endpoint(http_request: Request, api_index: int = Depends(verify_api_key)):
+    """透传 /v1/rerank（Cohere 风格重排序接口，如硅基流动 BAAI/bge-reranker 系列）。
+
+    复用渠道 Key 池：轮询、每日额度、token 窗口、请求级 provider_key_index 全部生效。
+    """
+    try:
+        payload = await http_request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+    request_model = str(payload.get("model") or "").strip()
+    if not request_model:
+        raise HTTPException(status_code=400, detail="缺少 model 字段")
+    if "query" not in payload or "documents" not in payload:
+        raise HTTPException(status_code=400, detail="rerank 请求必须包含 query 与 documents 字段")
+
+    config = app.state.config
+    # 统一 Key 模型白名单：与聊天路由一致（空名单 = 放行全部）
+    allowed_models = safe_get(config, "api_keys", api_index, "model", default=[]) or []
+    if allowed_models and "all" not in allowed_models and request_model not in allowed_models:
+        raise HTTPException(status_code=404, detail=f"No matching model found: {request_model}")
+
+    from uni_api.routing.core import extract_provider_key_index, select_provider_api_key_raw
+    from uni_api.rate_limit.quota import record_response_usage
+
+    # 发送前按字符数粗估 token（宁多勿少），供 token 窗口软上限预判选 Key
+    query_text = str(payload.get("query") or "")
+    docs = payload.get("documents") or []
+    estimated_tokens = max((len(query_text) + sum(len(str(d)) for d in docs)) // 2, 8)
+
+    # 找到映射了该模型的渠道（支持 {"对外": "上游"} dict 映射与纯字符串两种写法）
+    candidates: list[tuple[dict, str]] = []
+    for provider in safe_get(config, "providers", default=[]) or []:
+        for item in provider.get("model") or []:
+            if isinstance(item, dict):
+                original = item.get(request_model)
+            else:
+                original = str(item) if str(item) == request_model else None
+            if original:
+                candidates.append((provider, str(original)))
+                break
+    if not candidates:
+        raise HTTPException(status_code=404, detail=f"No matching model found: {request_model}")
+
+    key_index = extract_provider_key_index(payload, http_request)
+    last_error = "no provider"
+    for provider, original_model in candidates:
+        provider_name = str(provider.get("provider") or "")
+        base_url = str(provider.get("base_url") or "").rstrip("/")
+        if not base_url:
+            continue
+        try:
+            upstream_key = await select_provider_api_key_raw(
+                provider,
+                original_model,
+                get_runtime_api_list(),
+                provider_key_index=key_index,
+                estimated_tokens=estimated_tokens,
+            )
+        except HTTPException as exc:
+            last_error = f"{provider_name}: {exc.detail}"
+            continue
+        if not upstream_key:
+            last_error = f"{provider_name}: 无可用 Key（额度或 token 窗口受限）"
+            continue
+        upstream_body = dict(payload)
+        upstream_body["model"] = original_model
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+                resp = await client.post(
+                    base_url + "/rerank",
+                    json=upstream_body,
+                    headers={
+                        "Authorization": f"Bearer {upstream_key}",
+                        "Content-Type": "application/json",
+                    },
+                )
+        except httpx.HTTPError as exc:
+            last_error = f"{provider_name}: {type(exc).__name__}: {exc}"
+            continue
+        if resp.status_code != 200:
+            last_error = f"{provider_name}: HTTP {resp.status_code} {resp.text[:200]}"
+            continue
+        data = resp.json()
+        # 把 rerank 消耗计入该渠道账号的 token 窗口（与聊天同一账本）
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens") or estimated_tokens
+        completion_tokens = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+        record_response_usage(
+            {
+                "provider": provider_name,
+                "provider_api_key": upstream_key,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+            }
+        )
+        return JSONResponse(status_code=200, content=data)
+    raise HTTPException(status_code=502, detail=f"All {request_model} error: {last_error}")
+
 @app.post("/v1/audio/speech", dependencies=[Depends(rate_limit_dependency)])
 async def audio_speech(
     http_request: Request,
