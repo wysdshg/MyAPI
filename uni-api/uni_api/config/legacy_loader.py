@@ -27,10 +27,10 @@ yaml.indent(mapping=2, sequence=4, offset=2)
 API_YAML_PATH = "./api.yaml"
 yaml_error_message = None
 
-# api.yaml 落库加密（DPAPI）。keyvault.py 与本文件同在 uni-api/ 目录下。
+# api.yaml 落库加密（DPAPI/Fernet 双后端）。keyvault.py 与本文件同在 uni-api/ 目录下。
 try:
     import keyvault as _keyvault
-except ImportError:  # 兜底：模块缺失时按明文读取，行为与旧版一致
+except (ImportError, ValueError):  # 兜底：模块缺失或 wintypes 导入失败（旧版 Python）时按明文读取
     _keyvault = None
 
 

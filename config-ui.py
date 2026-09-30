@@ -7,13 +7,15 @@
 - 显示主服务进程的内存占用
 - 一键试调用某个模型，验证渠道 Key 是否还有额度
 
-仅监听 127.0.0.1，配置页面不对局域网开放。主服务请另行启动（start-uniapi.bat）。
+仅监听 127.0.0.1，配置页面不对局域网开放。主服务请另行启动
+（Windows: start-uniapi.bat；Linux: start-uniapi.sh）。
 """
 
 from __future__ import annotations
 
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -40,7 +42,7 @@ app = FastAPI()
 
 # ---------------- 配置读写 ----------------
 
-# api.yaml 落库加密（DPAPI）：读时自动解密，写时自动加密，明文不落盘
+# api.yaml 落库加密（DPAPI/Fernet 双后端）：读时自动解密，写时自动加密，明文不落盘
 sys.path.insert(0, str(BASE / "uni-api"))
 import keyvault  # noqa: E402
 
@@ -152,6 +154,8 @@ def normalize_providers(raw: list, existing: list | None = None) -> tuple[list, 
             base_meta = meta[name]
             if base_meta.get("daily_quota") in (None, ""):
                 base_meta["daily_quota"] = item.get("daily_quota")
+            if base_meta.get("schedule") != "fixed":
+                base_meta["schedule"] = item.get("schedule")
             for cost_name, cost_value in costs.items():
                 base_meta["costs"].setdefault(cost_name, cost_value)
             continue
@@ -171,7 +175,8 @@ def normalize_providers(raw: list, existing: list | None = None) -> tuple[list, 
             }
         )
         # 保留手工配置的 preferences（TOKEN_RATE_LIMIT 等），AUTO_RETRY 显式写入；
-        # 表单里的每日额度/单次消耗写入 DAILY_QUOTA / MODEL_COST（留空则移除）。
+        # 表单里的每日额度/单次消耗写入 DAILY_QUOTA / MODEL_COST（留空则移除）；
+        # Key 调度写 api_key_schedule_algorithm（轮换为默认值，移除该项保持 yaml 精简）。
         preferences = dict(old.get("preferences") or {})
         preferences["AUTO_RETRY"] = bool(item.get("auto_retry", True))
         daily_raw = item.get("daily_quota")
@@ -184,8 +189,16 @@ def normalize_providers(raw: list, existing: list | None = None) -> tuple[list, 
                 warnings.append(f"渠道「{name}」的每日额度 {daily_raw!r} 不是数字，已忽略")
         if costs:
             preferences["MODEL_COST"] = dict(costs)
+        if str(item.get("schedule") or "").strip() == "fixed":
+            preferences["api_key_schedule_algorithm"] = "fixed_priority"
+        else:
+            preferences.pop("api_key_schedule_algorithm", None)
         provider["preferences"] = preferences
-        meta[name] = {"daily_quota": item.get("daily_quota"), "costs": dict(costs)}
+        meta[name] = {
+            "daily_quota": item.get("daily_quota"),
+            "costs": dict(costs),
+            "schedule": str(item.get("schedule") or "").strip(),
+        }
         merged[name] = provider
         order.append(name)
 
@@ -223,13 +236,15 @@ def normalize_api_keys(raw: list, existing: list | None = None) -> list:
 
 # ---------------- 服务管理 ----------------
 
-# pythonw 无控制台，子进程默认会各新开一个控制台窗口——页面每 5 秒轮询
+# 进程管理平台分支：Windows 用 netstat/tasklist/taskkill，Linux 用 ss//proc/os.kill
+_IS_WINDOWS = os.name == "nt"
+# Windows 下 pythonw 无控制台，子进程默认会各新开一个控制台窗口——页面每 5 秒轮询
 # /api/status 时 netstat/tasklist 会不停闪烁，统一加上隐藏窗口标志。
-_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if _IS_WINDOWS else 0
 
 
 def _run_text(cmd: list[str]) -> str:
-    """中文 Windows 下 netstat/tasklist 输出 GBK，做自适应解码。"""
+    """子进程输出自适应解码（中文 Windows 下 netstat/tasklist 输出 GBK）。"""
     r = subprocess.run(cmd, capture_output=True, creationflags=_NO_WINDOW)
     text = r.stdout.decode("utf-8", errors="replace")
     if "\ufffd" in text:
@@ -238,41 +253,101 @@ def _run_text(cmd: list[str]) -> str:
 
 
 def server_pid() -> str | None:
-    out = _run_text(["netstat", "-ano"])
-    for line in out.splitlines():
-        parts = line.split()
-        if (
-            len(parts) == 5
-            and parts[3] == "LISTENING"
-            and parts[1].rsplit(":", 1)[-1] == str(MAIN_PORT)
-        ):
-            return parts[4]
-    return None
+    if _IS_WINDOWS:
+        out = _run_text(["netstat", "-ano"])
+        for line in out.splitlines():
+            parts = line.split()
+            if (
+                len(parts) == 5
+                and parts[3] == "LISTENING"
+                and parts[1].rsplit(":", 1)[-1] == str(MAIN_PORT)
+            ):
+                return parts[4]
+        return None
+    try:
+        out = _run_text(["ss", "-tlnpH", f"sport = :{MAIN_PORT}"])
+    except FileNotFoundError:  # 极简发行版可能没有 iproute2
+        return None
+    match = re.search(r"pid=(\d+)", out)
+    return match.group(1) if match else None
 
 
 def server_memory_mb(pid: str | None) -> float | None:
     if not pid:
         return None
-    out = _run_text(["tasklist", "/FI", f"PID eq {pid}"])
-    for line in out.splitlines():
-        if f" {pid} " in line or line.strip().endswith(str(pid)):
-            match = re.search(r"([\d,]+)\s*K\b", line)
-            if match:
-                return round(int(match.group(1).replace(",", "")) / 1024, 1)
+    if _IS_WINDOWS:
+        out = _run_text(["tasklist", "/FI", f"PID eq {pid}"])
+        for line in out.splitlines():
+            if f" {pid} " in line or line.strip().endswith(str(pid)):
+                match = re.search(r"([\d,]+)\s*K\b", line)
+                if match:
+                    return round(int(match.group(1).replace(",", "")) / 1024, 1)
+        return None
+    try:
+        with open(f"/proc/{pid}/status", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024, 1)
+    except (OSError, ValueError, IndexError):
+        return None
     return None
 
 
 def start_server() -> None:
     env = dict(os.environ, PORT=str(MAIN_PORT))
     log = open(RUN_LOG, "ab")
-    subprocess.Popen(
-        [sys.executable, str(BASE / "uni-api" / "main.py")],
-        cwd=str(BASE),
-        env=env,
-        stdout=log,
-        stderr=log,
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW,
-    )
+    if _IS_WINDOWS:
+        subprocess.Popen(
+            [sys.executable, str(BASE / "uni-api" / "main.py")],
+            cwd=str(BASE),
+            env=env,
+            stdout=log,
+            stderr=log,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW,
+        )
+    else:
+        # start_new_session：脱离配置页进程组，主服务独立常驻
+        subprocess.Popen(
+            [sys.executable, str(BASE / "uni-api" / "main.py")],
+            cwd=str(BASE),
+            env=env,
+            stdout=log,
+            stderr=log,
+            start_new_session=True,
+        )
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _kill_pid(pid: str) -> None:
+    """停止主服务进程。Windows 用 taskkill /F；POSIX 先 SIGTERM 优雅退出，5 秒超时 SIGKILL。"""
+    if _IS_WINDOWS:
+        subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True, creationflags=_NO_WINDOW)
+        return
+    try:
+        pid_int = int(pid)
+    except ValueError:
+        return
+    try:
+        os.kill(pid_int, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    for _ in range(50):
+        if not _pid_alive(pid_int):
+            return
+        time.sleep(0.1)
+    try:
+        os.kill(pid_int, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 # ---------------- 接口 ----------------
@@ -358,6 +433,12 @@ def get_config():
                 "models": models,
                 "auto_retry": bool(prefs.get("AUTO_RETRY", True)),
                 "daily_quota": prefs.get("DAILY_QUOTA"),
+                "schedule": (
+                    "fixed"
+                    if str(prefs.get("api_key_schedule_algorithm") or "").strip()
+                    == "fixed_priority"
+                    else "round"
+                ),
             }
         )
     api_keys = [
@@ -438,12 +519,12 @@ def server_action(action: str):
     pid = server_pid()
     if action == "stop":
         if pid:
-            subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True, creationflags=_NO_WINDOW)
+            _kill_pid(pid)
             return {"ok": True, "stopped": pid}
         return {"ok": False, "message": "服务未在运行"}
     if action == "restart":
         if pid:
-            subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True, creationflags=_NO_WINDOW)
+            _kill_pid(pid)
             time.sleep(1.5)
         start_server()
         return {"ok": True}
@@ -455,9 +536,13 @@ def server_action(action: str):
     return JSONResponse({"error": "unknown action"}, status_code=404)
 
 
-@app.post("/api/test/{model}")
+@app.post("/api/test/{model:path}")
 async def test_model(model: str):
-    """通过主服务试调用一个模型，验证渠道可用性。"""
+    """通过主服务试调用一个模型，验证渠道可用性。
+
+    {model:path} 允许模型名带斜杠（如 Qwen/Qwen3.8-Flash-Next）；
+    普通路由参数遇 %2F 会被 uvicorn 解码成 / 导致 404。
+    """
     data = load_config()
     key = next(
         (k.get("api") for k in data.get("api_keys") or [] if k.get("api")), None
@@ -506,10 +591,10 @@ HTML_PAGE = """<!DOCTYPE html>
   .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
   .field { flex:1; min-width:220px; }
   label { display:block; font-size:12px; color:var(--sub); margin-bottom:4px; }
-  input, textarea { width:100%; border:1px solid var(--line); border-radius:6px;
+  input, textarea, select { width:100%; border:1px solid var(--line); border-radius:6px;
           padding:6px 8px; font:inherit; background:#fbfbfc; }
   textarea { font-family:Consolas,monospace; font-size:12.5px; }
-  input:focus, textarea:focus { outline:none; border-color:var(--pri); }
+  input:focus, textarea:focus, select:focus { outline:none; border-color:var(--pri); }
   button { border:none; border-radius:6px; padding:7px 14px; font:inherit;
           cursor:pointer; background:var(--pri); color:#fff; }
   button.ghost { background:#fff; color:var(--txt); border:1px solid var(--line); }
@@ -631,6 +716,11 @@ function render(st) {
       <div class="row" style="margin-top:8px">
         <div class="field"><label>每日额度（如魔搭 250 魔粒/天，留空不启用）</label>
           <input value="${esc(p.daily_quota ?? '')}" oninput="CFG.providers[${i}].daily_quota=this.value"></div>
+        <div class="field"><label>Key 调度（多 Key 时生效）</label>
+          <select onchange="CFG.providers[${i}].schedule=this.value">
+            <option value="round" ${p.schedule !== 'fixed' ? 'selected' : ''}>轮换（平均分摊负载）</option>
+            <option value="fixed" ${p.schedule === 'fixed' ? 'selected' : ''}>顺序（用完一个额度再换下一个）</option>
+          </select></div>
         <label style="display:flex;align-items:center;gap:6px;margin:0">
           <input type="checkbox" style="width:auto" ${p.auto_retry !== false ? 'checked' : ''}
             onchange="CFG.providers[${i}].auto_retry=this.checked">

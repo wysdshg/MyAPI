@@ -50,7 +50,9 @@
 
 # ---------- 模板 5: 模型 ModelScope 魔搭（每日 250 魔粒按模型计费） ----------
 # - provider: modelscope
-#   base_url: https://api-inference.modelscope.cn/v1
+#   base_url: https://api-inference.modelscope.cn/v1/chat/completions
+#   # 注意必须写全到 /chat/completions：魔搭模型名不含 gpt/claude 等关键词，
+#   # 网关会走 openrouter 引擎（不自动补全路径），写 /v1 结尾会 404
 #   api:                           # 多个账号（多把魔搭 Key）写成列表
 #     - ms-aaaaaaaaaaaaaaaa
 #     - ms-bbbbbbbbbbbbbbbb
